@@ -2,20 +2,29 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 
-# --- 頁面設定 (極簡模式) ---
-st.set_page_config(page_title="AHP 層級權重計算", layout="centered") 
+# --- 頁面設定 ---
+st.set_page_config(page_title="AHP 層級分析系統 V5.0", layout="wide")
 
-# --- 核心數學函式 (不變，但移除囉唆的檢查) ---
+# --- 核心數學函式 ---
 def repair_matrix(matrix):
     """修復矩陣：強制對角線為1，補全左下角"""
+    # 確保矩陣是浮點數
+    matrix = np.array(matrix, dtype=float)
     rows, cols = matrix.shape
-    matrix = matrix.astype(float)
+    
     for i in range(rows):
         for j in range(cols):
-            if i == j: matrix[i, j] = 1.0
+            if i == j: 
+                matrix[i, j] = 1.0
             elif i < j:
-                if matrix[i, j] == 0 or np.isnan(matrix[i, j]): matrix[i, j] = 1.0
-                matrix[j, i] = 1.0 / matrix[i, j]
+                # 右上角：如果讀到 0 或 NaN，預設補 1
+                if matrix[i, j] == 0 or np.isnan(matrix[i, j]): 
+                    matrix[i, j] = 1.0
+                # 左下角：強制倒數
+                if matrix[i, j] != 0:
+                    matrix[j, i] = 1.0 / matrix[i, j]
+                else:
+                    matrix[j, i] = 1.0 # 避免除以零
     return matrix
 
 def calculate_ahp(matrix):
@@ -28,14 +37,15 @@ def calculate_ahp(matrix):
     weights = normalized_matrix.mean(axis=1)
     
     lambda_max = np.dot(col_sums, weights)
-    ci = (lambda_max - n) / (n - 1)
+    ci = (lambda_max - n) / (n - 1) if n > 1 else 0
     ri_table = {1:0, 2:0, 3:0.58, 4:0.90, 5:1.12, 6:1.24, 7:1.32, 8:1.41, 9:1.45, 10:1.49}
     ri = ri_table.get(n, 1.49)
     cr = ci / ri if n > 2 else 0
-    return weights, cr
+    return weights, cr, matrix
 
 def geometric_mean_matrix(matrices):
     """多專家幾何平均"""
+    if not matrices: return None
     stack = np.array(matrices)
     prod = np.prod(stack, axis=0)
     geo_mean = np.power(prod, 1/len(matrices))
@@ -43,104 +53,114 @@ def geometric_mean_matrix(matrices):
 
 # --- 主程式介面 ---
 
-st.title("⚖️ AHP 極簡權重計算器")
+st.title("⚖️ AHP 層級分析系統 (V5.0 強制裁切版)")
+st.markdown("解決「權重一樣」與「讀到空白格」的問題。")
 
-# 使用 Tab 分流，讓畫面不雜亂
-tab1, tab2 = st.tabs(["Step 1: 上傳計算權重", "Step 2: 計算全球權重"])
+tab1, tab2 = st.tabs(["Step 1: 計算局部權重", "Step 2: 整合全球權重"])
 
-# === Tab 1: 單一檔案計算器 ===
+# === Tab 1: 權重計算器 ===
 with tab1:
-    st.markdown("### 📥 單層權重計算")
-    st.info("說明：請依序上傳「構面」或「各準則」的 Excel 檔。計算出權重後，請抄寫或複製下來，填入 Step 2。")
+    col1, col2 = st.columns([1, 2])
     
-    uploaded_file = st.file_uploader("上傳 Excel 檔 (支援多專家 Sheet)", type=['xlsx', 'xls'])
+    with col1:
+        st.info("💡 操作提示：\n1. 上傳 Excel。\n2. 若讀取範圍錯誤 (例如出現 8 個指標)，請調整下方的「裁切設定」。")
+        uploaded_file = st.file_uploader("上傳 Excel 檔", type=['xlsx', 'xls'])
+        
+        # --- 關鍵功能：手動裁切 ---
+        st.write("---")
+        st.markdown("**✂️ 矩陣裁切設定**")
+        manual_n = st.number_input("強制設定指標數量 (N)", min_value=0, max_value=15, value=0, help="設為 0 代表自動偵測。若您只填了 3 個指標卻跑出 8 個，請手動改成 3。")
 
-    if uploaded_file is not None:
-        try:
-            excel_file = pd.ExcelFile(uploaded_file)
-            sheet_names = excel_file.sheet_names
-            valid_matrices = []
-            
-            # 靜默處理所有 Sheet
-            for sheet in sheet_names:
-                df = pd.read_excel(uploaded_file, sheet_name=sheet, header=None)
-                df_numeric = df.apply(pd.to_numeric, errors='coerce')
-                df_clean = df_numeric.dropna(how='all').dropna(axis=1, how='all')
-                raw_matrix = df_clean.values
+    with col2:
+        if uploaded_file is not None:
+            try:
+                excel_file = pd.ExcelFile(uploaded_file)
+                sheet_names = excel_file.sheet_names
+                valid_matrices = []
                 
-                rows, cols = raw_matrix.shape
-                if rows > 2 and rows == cols:
-                    # 嘗試修復並加入
-                    try:
-                        repaired = repair_matrix(raw_matrix)
-                        valid_matrices.append(repaired)
-                    except:
-                        pass
+                st.write(f"📄 偵測到 {len(sheet_names)} 位專家資料")
 
-            if valid_matrices:
-                # 直接進行群體整合
-                final_matrix = geometric_mean_matrix(valid_matrices)
-                final_weights, final_cr = calculate_ahp(final_matrix)
-                
-                # --- 結果顯示區 (極簡化) ---
-                st.success(f"✅ 計算完成 (整合了 {len(valid_matrices)} 位專家)")
-                
-                if final_cr > 0.1:
-                    st.warning(f"⚠️ 注意：整合後 CR 值為 {final_cr:.4f} (大於 0.1)，但下方仍顯示權重供參考。")
+                for sheet in sheet_names:
+                    # 1. 讀取資料
+                    df = pd.read_excel(uploaded_file, sheet_name=sheet, header=None)
+                    
+                    # 2. 資料清理：轉數字
+                    df = df.apply(pd.to_numeric, errors='coerce')
+                    
+                    # 3. 抓取矩陣 (自動移除全空的行列)
+                    df_clean = df.dropna(how='all').dropna(axis=1, how='all')
+                    raw_matrix = df_clean.values
+                    
+                    # 4. 強制裁切 (關鍵步驟！)
+                    if manual_n > 0:
+                        # 如果使用者指定了 N，就只取左上角的 NxN
+                        if raw_matrix.shape[0] >= manual_n and raw_matrix.shape[1] >= manual_n:
+                            raw_matrix = raw_matrix[:manual_n, :manual_n]
+                    
+                    rows, cols = raw_matrix.shape
+                    
+                    # 5. 驗證形狀
+                    if rows == cols and rows > 1:
+                        valid_matrices.append(raw_matrix)
+                    else:
+                        st.warning(f"⚠️ 工作表 {sheet} 格式異常 (大小 {rows}x{cols})，已略過。")
+
+                if valid_matrices:
+                    # 顯示它到底讀到了什麼 (Debug 視窗)
+                    with st.expander("🔍 點此檢查：系統讀到的矩陣數據 (第一位專家)", expanded=True):
+                        st.write(f"目前矩陣大小：**{valid_matrices[0].shape[0]} x {valid_matrices[0].shape[0]}**")
+                        st.dataframe(pd.DataFrame(valid_matrices[0]))
+                        if valid_matrices[0].shape[0] > 3 and manual_n == 0:
+                            st.error("❗ 注意：如果您只填了 3 個指標，但上面顯示 8x8 或更大，請將左側的「強制設定指標數量」改為 3！")
+
+                    # 進行計算
+                    final_matrix = geometric_mean_matrix(valid_matrices)
+                    weights, cr, _ = calculate_ahp(final_matrix)
+                    
+                    st.success("✅ 計算完成！")
+                    
+                    # 結果顯示
+                    res_col1, res_col2 = st.columns(2)
+                    with res_col1:
+                        st.metric("整合後 CR 值", f"{cr:.4f}", delta="合格" if cr < 0.1 else "不一致", delta_color="inverse")
+                    
+                    # 表格
+                    df_res = pd.DataFrame({
+                        "指標": [f"指標 {i+1}" for i in range(len(weights))],
+                        "權重": weights
+                    })
+                    st.dataframe(df_res.style.format({"權重": "{:.2%}"}).background_gradient(cmap="Blues"))
+                    
+                    st.caption("請複製此處權重，填入 Step 2 進行整合。")
+
                 else:
-                    st.caption(f"一致性檢定通過 (CR = {final_cr:.4f})")
+                    st.error("無法讀取有效矩陣。請確認 Excel 內容或嘗試調整裁切設定。")
 
-                # 只顯示純淨的表格
-                df_res = pd.DataFrame({
-                    "項目名稱 (自行對照)": [f"項目 {i+1}" for i in range(len(final_weights))],
-                    "權重 (Weight)": final_weights
-                })
-                # 格式化顯示百分比，但保留原始數值方便複製
-                st.dataframe(df_res.style.format({"權重 (Weight)": "{:.4%}"}))
+            except Exception as e:
+                st.error(f"發生錯誤：{e}")
 
-            else:
-                st.error("無法讀取有效矩陣，請檢查 Excel 格式。")
-
-        except Exception as e:
-            st.error(f"錯誤：{e}")
-
-# === Tab 2: 全球權重整合表 ===
+# === Tab 2: 全球權重整合 ===
 with tab2:
-    st.markdown("### 🌍 全球權重 (Global Weight) 整合")
-    st.markdown("請將 Step 1 算出的數據填入下方表格：")
+    st.markdown("### 🌍 全球權重計算表")
+    st.info("請將 Step 1 算出的「構面權重」與「準則權重」填入下方。")
 
-    # 初始化預設表格數據
     if "grid_data" not in st.session_state:
         st.session_state.grid_data = pd.DataFrame(
             [
-                {"構面名稱": "構面A", "構面權重": 0.5, "準則名稱": "準則A-1", "準則局部權重": 0.6},
-                {"構面名稱": "構面A", "構面權重": 0.5, "準則名稱": "準則A-2", "準則局部權重": 0.4},
-                {"構面名稱": "構面B", "構面權重": 0.5, "準則名稱": "準則B-1", "準則局部權重": 0.3},
-                {"構面名稱": "構面B", "構面權重": 0.5, "準則名稱": "準則B-2", "準則局部權重": 0.7},
+                {"構面": "構面A", "構面權重": 0.5, "準則": "準則A1", "準則局部權重": 0.6},
+                {"構面": "構面A", "構面權重": 0.5, "準則": "準則A2", "準則局部權重": 0.4},
             ]
         )
 
-    # 可編輯的表格
     edited_df = st.data_editor(st.session_state.grid_data, num_rows="dynamic", use_container_width=True)
 
-    # 自動計算按鈕
     if st.button("計算最終排名"):
-        # 計算全球權重
-        result_df = edited_df.copy()
-        # 確保是數字
-        result_df["構面權重"] = pd.to_numeric(result_df["構面權重"], errors='coerce').fillna(0)
-        result_df["準則局部權重"] = pd.to_numeric(result_df["準則局部權重"], errors='coerce').fillna(0)
+        res = edited_df.copy()
+        res["構面權重"] = pd.to_numeric(res["構面權重"], errors='coerce').fillna(0)
+        res["準則局部權重"] = pd.to_numeric(res["準則局部權重"], errors='coerce').fillna(0)
+        res["全球權重"] = res["構面權重"] * res["準則局部權重"]
+        res = res.sort_values("全球權重", ascending=False).reset_index(drop=True)
         
-        # 核心公式：全球權重 = 構面權重 * 準則局部權重
-        result_df["全球權重"] = result_df["構面權重"] * result_df["準則局部權重"]
-        
-        # 排序
-        result_df = result_df.sort_values(by="全球權重", ascending=False).reset_index(drop=True)
-        
-        # 顯示結果
-        st.write("### 🏆 最終分析結果")
-        st.dataframe(result_df.style.format({
-            "構面權重": "{:.4%}", 
-            "準則局部權重": "{:.4%}", 
-            "全球權重": "{:.4%}"
+        st.dataframe(res.style.format({
+            "構面權重": "{:.2%}", "準則局部權重": "{:.2%}", "全球權重": "{:.2%}"
         }))
