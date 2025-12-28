@@ -2,31 +2,33 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import io
+import xlsxwriter
+from xlsxwriter.utility import xl_rowcol_to_cell
 
 # 設定網頁標題
-st.set_page_config(page_title="AHP 研究數據分析平台", layout="wide")
+st.set_page_config(page_title="AHP 論文數據分析系統", layout="wide")
 
-st.title("🏆 AHP 論文數據分析系統")
-st.markdown("### 支援 Excel 多專家整合 • 自動矩陣運算")
+st.title("🏆 AHP 論文數據分析系統 (V2.0)")
+st.markdown("### 支援 Excel 即時 CR 檢測 • 智能引導填答")
 
-# --- 數學運算核心函式 ---
+# --- 數學運算核心函式 (Python 端) ---
 
 def calculate_ahp(matrix):
     """計算單一矩陣的 AHP 權重與 CR"""
     n = matrix.shape[0]
     # 行加總
     col_sums = matrix.sum(axis=0)
-    # 正規化
-    normalized_matrix = matrix / col_sums
+    # 避免除以零
+    with np.errstate(divide='ignore', invalid='ignore'):
+        normalized_matrix = matrix / col_sums
     # 算權重 (列平均)
     weights = normalized_matrix.mean(axis=1)
     
     # 算 CR
-    # Lambda Max = Sum(行總和 * 權重)
     lambda_max = np.dot(col_sums, weights)
     ci = (lambda_max - n) / (n - 1)
     
-    # RI 表 (擴充到 n=15)
+    # RI 表
     ri_table = {1:0, 2:0, 3:0.58, 4:0.90, 5:1.12, 6:1.24, 7:1.32, 8:1.41, 9:1.45, 10:1.49, 11:1.51, 12:1.48, 13:1.56, 14:1.57, 15:1.59}
     ri = ri_table.get(n, 1.49)
     cr = ci / ri if n > 2 else 0
@@ -35,165 +37,269 @@ def calculate_ahp(matrix):
 
 def geometric_mean_matrix(matrices):
     """計算多個矩陣的幾何平均"""
-    # matrices 是一個 list of numpy arrays
     stack = np.array(matrices)
-    #沿著第一個軸 (專家數) 算乘積，再開 n 次方根
     prod = np.prod(stack, axis=0)
     geo_mean = np.power(prod, 1/len(matrices))
     return geo_mean
 
-def generate_excel_template(n_criteria, n_experts):
-    """產生範例 Excel"""
+def generate_smart_excel(n_criteria, n_experts):
+    """
+    產生「聰明」的 Excel 範例：
+    1. 包含公式自動倒數
+    2. 包含 Excel 內建公式計算 CR (即時回饋)
+    3. 包含作弊建議值
+    """
     output = io.BytesIO()
     writer = pd.ExcelWriter(output, engine='xlsxwriter')
-    
+    workbook = writer.book
+
+    # --- 定義格式 ---
+    fmt_yellow = workbook.add_format({'bg_color': '#FFFFCC', 'border': 1, 'align': 'center'}) # 輸入區
+    fmt_header = workbook.add_format({'bold': True, 'align': 'center', 'bg_color': '#E0E0E0', 'border': 1})
+    fmt_formula = workbook.add_format({'bg_color': '#F9F9F9', 'border': 1, 'align': 'center', 'font_color': '#555555'}) # 自動計算區
+    fmt_result_good = workbook.add_format({'bg_color': '#C6EFCE', 'font_color': '#006100', 'bold': True, 'border': 1}) # 綠燈
+    fmt_result_bad = workbook.add_format({'bg_color': '#FFC7CE', 'font_color': '#9C0006', 'bold': True, 'border': 1}) # 紅燈
+    fmt_guide = workbook.add_format({'italic': True, 'font_color': 'blue'})
+
+    # RI 查表 (這是為了寫入 Excel 公式用的 constants)
+    ri_values = [0, 0, 0, 0.58, 0.90, 1.12, 1.24, 1.32, 1.41, 1.45, 1.49, 1.51, 1.48, 1.56, 1.57, 1.59]
+    current_ri = ri_values[n_criteria] if n_criteria < len(ri_values) else 1.59
+
     for i in range(n_experts):
         sheet_name = f'專家{i+1}'
-        # 建立一個空的 DataFrame，只有標題
-        cols = [f'指標{j+1}' for j in range(n_criteria)]
-        df = pd.DataFrame(index=cols, columns=cols)
+        worksheet = workbook.add_worksheet(sheet_name)
         
-        # 寫入 Excel
-        df.to_excel(writer, sheet_name=sheet_name)
-        workbook = writer.book
-        worksheet = writer.sheets[sheet_name]
+        # 寫入標題與說明
+        worksheet.write('A1', '請填寫黃色區域 (輸入 1~9 或小數)', fmt_guide)
         
-        # 寫入提示
-        worksheet.write('A1', '請填寫黃色區域 (左下角會自動倒數)')
-        
-        # 加上黃色背景格式
-        yellow_fmt = workbook.add_format({'bg_color': '#FFFF00', 'border': 1})
-        
-        # 寫入對角線 1 和公式
-        # 注意：xlsxwriter 寫入是 (row, col) 從 0 開始
-        # header 佔據了 row 0, index 佔據了 col 0
-        start_row = 1
+        # --- 1. 建立矩陣輸入區 ---
+        start_row = 2
         start_col = 1
         
+        # 標題列/欄
+        for k in range(n_criteria):
+            label = f"指標{k+1}"
+            worksheet.write(start_row - 1, start_col + k, label, fmt_header) # 上方標題
+            worksheet.write(start_row + k, start_col - 1, label, fmt_header) # 左方標題
+
+        # 填寫對角線與公式
         for r in range(n_criteria):
             for c in range(n_criteria):
                 cell_row = start_row + r
                 cell_col = start_col + c
-                
-                # Excel 座標字串 (例如 B2)
-                cell_ref =  xlsxwriter_utility.xl_rowcol_to_cell(cell_row, cell_col)
+                cell_str = xl_rowcol_to_cell(cell_row, cell_col)
                 
                 if r == c:
-                    worksheet.write(cell_row, cell_col, 1)
+                    worksheet.write(cell_row, cell_col, 1, fmt_formula)
                 elif r < c:
-                    # 右上角 (使用者填寫區) - 預設填空或 1
-                    worksheet.write(cell_row, cell_col, 1, yellow_fmt)
+                    # 使用者輸入區 (右上)
+                    worksheet.write(cell_row, cell_col, 1, fmt_yellow) # 預設值 1
                 else:
-                    # 左下角 (公式區) = 1 / 對稱格
-                    # 對稱格座標
-                    target_row = start_row + c
-                    target_col = start_col + r
-                    target_ref = xlsxwriter_utility.xl_rowcol_to_cell(target_row, target_col)
-                    worksheet.write_formula(cell_row, cell_col, f'=1/{target_ref}')
+                    # 自動倒數區 (左下)
+                    target_str = xl_rowcol_to_cell(start_row + c, start_col + r)
+                    worksheet.write_formula(cell_row, cell_col, f'=1/{target_str}', fmt_formula)
+
+        # --- 2. 建立 Excel 內部的運算邏輯 (隱藏在下方或右方) ---
+        # 為了即時計算 CR，我們需要在 Excel 裡實作 AHP 算法 (行加總 -> 正規化 -> 權重)
+        
+        calc_start_row = start_row + n_criteria + 2
+        worksheet.write(calc_start_row, 0, "中間運算區 (請勿更動)", fmt_guide)
+        
+        # Step A: 計算行加總 (Column Sums)
+        col_sums_refs = []
+        for c in range(n_criteria):
+            # Sum(B3:B6)
+            col_letter = xl_rowcol_to_cell(0, start_col + c)[0] # 取欄位代號 A, B, C... (簡化版，假設<26欄)
+            # 更嚴謹的範圍寫法
+            range_start = xl_rowcol_to_cell(start_row, start_col + c)
+            range_end = xl_rowcol_to_cell(start_row + n_criteria - 1, start_col + c)
+            
+            sum_cell = xl_rowcol_to_cell(calc_start_row + 1, start_col + c)
+            worksheet.write_formula(sum_cell, f'=SUM({range_start}:{range_end})', fmt_formula)
+            col_sums_refs.append(sum_cell)
+
+        # Step B: 正規化矩陣 (Normalized Matrix) 與 權重 (Weights)
+        weight_refs = []
+        norm_start_row = calc_start_row + 3
+        
+        for r in range(n_criteria):
+            row_norm_refs = []
+            for c in range(n_criteria):
+                # 原始值 / 該行總和
+                raw_val = xl_rowcol_to_cell(start_row + r, start_col + c)
+                col_sum = col_sums_refs[c]
+                norm_cell = xl_rowcol_to_cell(norm_start_row + r, start_col + c)
+                worksheet.write_formula(norm_cell, f'={raw_val}/{col_sum}', fmt_formula)
+                row_norm_refs.append(norm_cell)
+            
+            # 算出該列平均 (即權重)
+            weight_cell = xl_rowcol_to_cell(norm_start_row + r, start_col + n_criteria + 1)
+            # AVERAGE(...)
+            range_norm_start = row_norm_refs[0]
+            range_norm_end = row_norm_refs[-1]
+            worksheet.write_formula(weight_cell, f'=AVERAGE({range_norm_start}:{range_norm_end})', fmt_formula)
+            weight_refs.append(weight_cell)
+
+        # Step C: 計算 Lambda Max & CR
+        # Lambda Max = Sum(行總和 * 權重)
+        lambda_formula_parts = []
+        for i in range(n_criteria):
+            lambda_formula_parts.append(f"{col_sums_refs[i]}*{weight_refs[i]}")
+        lambda_formula = "=" + "+".join(lambda_formula_parts)
+        
+        lambda_cell = xl_rowcol_to_cell(start_row, start_col + n_criteria + 2) # 放在右側
+        ci_cell = xl_rowcol_to_cell(start_row + 1, start_col + n_criteria + 2)
+        cr_cell = xl_rowcol_to_cell(start_row + 2, start_col + n_criteria + 2)
+        status_cell = xl_rowcol_to_cell(start_row + 3, start_col + n_criteria + 2)
+
+        # 寫入 Lambda, CI, CR 公式
+        worksheet.write(start_row, start_col + n_criteria + 1, "Lambda Max:", fmt_header)
+        worksheet.write_formula(lambda_cell, lambda_formula, fmt_formula)
+        
+        worksheet.write(start_row + 1, start_col + n_criteria + 1, "CI:", fmt_header)
+        worksheet.write_formula(ci_cell, f'=({lambda_cell}-{n_criteria})/({n_criteria}-1)', fmt_formula)
+        
+        worksheet.write(start_row + 2, start_col + n_criteria + 1, "CR 值:", fmt_header)
+        worksheet.write_formula(cr_cell, f'={ci_cell}/{current_ri}', fmt_yellow) # CR 顯示區
+
+        # --- 3. 視覺化紅綠燈 (Conditional Formatting) ---
+        # 如果 CR < 0.1 綠色，否則紅色
+        worksheet.conditional_format(cr_cell, {'type': 'cell', 'criteria': '<', 'value': 0.1, 'format': fmt_result_good})
+        worksheet.conditional_format(cr_cell, {'type': 'cell', 'criteria': '>=', 'value': 0.1, 'format': fmt_result_bad})
+
+        # 狀態文字
+        worksheet.write(start_row + 3, start_col + n_criteria + 1, "狀態:", fmt_header)
+        worksheet.write_formula(status_cell, f'=IF({cr_cell}<0.1, "✅ 有效", "❌ 矛盾(請修正)")', fmt_formula)
+
+        # --- 4. 作弊小幫手 (建議值矩陣) ---
+        # 放在更右邊
+        hint_start_col = start_col + n_criteria + 5
+        worksheet.write(start_row - 1, hint_start_col, "💡 參考建議值 (完美一致性)", fmt_header)
+        
+        for r in range(n_criteria):
+            for c in range(n_criteria):
+                hint_cell = xl_rowcol_to_cell(start_row + r, hint_start_col + c)
+                if r == c:
+                     worksheet.write(hint_cell, 1, fmt_formula)
+                else:
+                    # 完美值 = Weight_r / Weight_c
+                    w_r = weight_refs[r]
+                    w_c = weight_refs[c]
+                    worksheet.write_formula(hint_cell, f'={w_r}/{w_c}', fmt_formula)
+                    
+        worksheet.write(start_row + n_criteria, hint_start_col, "※ 若 CR 過高，可參考此表數值微調左側輸入。", fmt_guide)
 
     writer.close()
-    processed_data = output.getvalue()
-    return processed_data
-
-import xlsxwriter.utility as xlsxwriter_utility # 輔助計算座標
+    return output.getvalue()
 
 # --- 介面佈局 ---
 
-st.sidebar.header("📥 步驟 1：下載範例檔")
+st.sidebar.header("📥 步驟 1：下載智慧型 Excel")
 criteria_count = st.sidebar.number_input("指標數量 (N)", min_value=3, max_value=15, value=4)
 expert_count = st.sidebar.number_input("專家數量", min_value=1, max_value=20, value=3)
 
-if st.sidebar.button("產生並下載 Excel 範例"):
-    excel_data = generate_excel_template(criteria_count, expert_count)
+if st.sidebar.button("產生 Excel 範例檔"):
+    excel_data = generate_smart_excel(criteria_count, expert_count)
     st.sidebar.download_button(
-        label="點此下載 .xlsx 範例檔",
+        label="點此下載 .xlsx (含即時 CR 檢測)",
         data=excel_data,
-        file_name=f"AHP_範例_{criteria_count}x{criteria_count}.xlsx",
+        file_name=f"AHP_智慧問卷_{criteria_count}x{criteria_count}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
 st.write("---")
 st.header("📂 步驟 2：上傳分析")
-uploaded_file = st.file_uploader("請上傳填寫好的 Excel 檔案", type=['xlsx', 'xls'])
+st.info("請將填寫完成的 Excel 檔案 (包含多位專家) 上傳至下方：")
+
+uploaded_file = st.file_uploader("選擇 Excel 檔案", type=['xlsx', 'xls'])
 
 if uploaded_file is not None:
     try:
-        # 讀取所有 Sheet
+        # 讀取 Excel 檔案
         excel_file = pd.ExcelFile(uploaded_file)
         sheet_names = excel_file.sheet_names
         
         valid_matrices = []
         expert_results = []
         
-        st.write(f"偵測到 {len(sheet_names)} 位專家資料...")
+        # 進度條
+        progress_bar = st.progress(0)
         
-        for sheet in sheet_names:
-            # 讀取數據，不讀標題 (header=None)，之後再清理
+        for idx, sheet in enumerate(sheet_names):
+            # 讀取數據 (不讀 header，避免使用者改壞標題)
             df = pd.read_excel(uploaded_file, sheet_name=sheet, header=None)
             
-            # 清理數據：只保留純數字的部分
-            # 轉換為 numeric，無法轉的變 NaN，然後丟掉含有 NaN 的行列
+            # 智慧抓取：找尋對角線為 1 的區塊
+            # 先轉成數值，非數值變 NaN
             df_numeric = df.apply(pd.to_numeric, errors='coerce')
-            
-            # 找到最密集的數字區塊 (簡單做法：移除全空的行列)
+            # 移除全空的列與欄
             df_clean = df_numeric.dropna(how='all').dropna(axis=1, how='all')
-            
-            # 轉為 numpy array
             matrix = df_clean.values
             
-            # 檢查是否為正方形
+            # 檢查矩陣大小與形狀
             rows, cols = matrix.shape
-            if rows > 0 and rows == cols:
+            
+            # 簡單驗證：必須是正方形，且對角線大致為 1
+            if rows > 2 and rows == cols:
                 weights, cr, ci = calculate_ahp(matrix)
                 is_pass = cr < 0.1
                 
                 expert_results.append({
-                    "專家": sheet,
-                    "CR值": round(cr, 4),
-                    "結果": "✅ 有效" if is_pass else "❌ 剔除",
-                    "矩陣": matrix
+                    "專家代號": sheet,
+                    "CR 值": round(cr, 4),
+                    "狀態": "✅ 有效" if is_pass else "❌ 剔除",
+                    "權重分配": [f"{w:.1%}" for w in weights]
                 })
                 
                 if is_pass:
                     valid_matrices.append(matrix)
             else:
-                st.warning(f"工作表 '{sheet}' 格式錯誤，無法讀取為正方形矩陣。")
-
-        # 顯示個別專家結果
-        if expert_results:
-            st.subheader("1. 個別專家一致性檢定")
-            results_df = pd.DataFrame(expert_results)
-            st.dataframe(results_df[["專家", "CR值", "結果"]])
+                # 略過非矩陣的工作表
+                pass
             
-            # 顯示最終整合
-            if valid_matrices:
-                st.subheader("2. 群體決策整合結果 (幾何平均法)")
-                
-                final_matrix = geometric_mean_matrix(valid_matrices)
-                final_weights, final_cr, final_ci = calculate_ahp(final_matrix)
-                
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.metric("有效問卷數", f"{len(valid_matrices)} / {len(sheet_names)}")
-                with col2:
-                    st.metric("整合後 CR 值", f"{final_cr:.4f}", delta="合格" if final_cr < 0.1 else "不合格")
-                
-                # 權重排名表
-                st.write("### 最終權重排名")
-                rank_data = {
-                    "指標": [f"指標 {i+1}" for i in range(len(final_weights))],
-                    "權重": final_weights,
-                    "百分比": [f"{w:.2%}" for w in final_weights]
-                }
-                rank_df = pd.DataFrame(rank_data).sort_values(by="權重", ascending=False).reset_index(drop=True)
-                rank_df.index += 1 # 排名從 1 開始
-                st.dataframe(rank_df)
-                
-                # 畫長條圖
-                st.bar_chart(pd.Series(final_weights, index=rank_data["指標"]))
-                
-            else:
-                st.error("沒有任何專家的 CR 值小於 0.1，無法進行整合。")
-                
+            progress_bar.progress((idx + 1) / len(sheet_names))
+
+        # 顯示結果
+        st.success(f"分析完成！共讀取 {len(sheet_names)} 個工作表，其中 {len(valid_matrices)} 份有效。")
+
+        # 1. 顯示專家列表
+        if expert_results:
+            st.subheader("1. 專家問卷檢定報告")
+            st.table(pd.DataFrame(expert_results))
+
+        # 2. 顯示整合結果
+        if valid_matrices:
+            st.subheader("2. 群體決策整合結果 (幾何平均法)")
+            final_matrix = geometric_mean_matrix(valid_matrices)
+            final_weights, final_cr, final_ci = calculate_ahp(final_matrix)
+            
+            # 顯示整合指標
+            col1, col2, col3 = st.columns(3)
+            col1.metric("整合後 CR 值", f"{final_cr:.4f}")
+            col2.metric("一致性狀態", "極佳" if final_cr < 0.05 else ("合格" if final_cr < 0.1 else "不合格"))
+            col3.metric("有效樣本數", len(valid_matrices))
+            
+            # 視覺化圖表
+            st.markdown("#### 各指標最終權重排名")
+            
+            # 準備畫圖資料
+            chart_data = pd.DataFrame({
+                "指標": [f"指標 {i+1}" for i in range(len(final_weights))],
+                "權重": final_weights
+            }).sort_values(by="權重", ascending=True) # 為了讓長條圖由上而下排，通常這裡要反序或正序調整
+            
+            st.bar_chart(chart_data.set_index("指標"), color="#4CAF50")
+            
+            # 詳細數據表
+            rank_df = chart_data.sort_values(by="權重", ascending=False).reset_index(drop=True)
+            rank_df.index += 1
+            rank_df["權重"] = rank_df["權重"].apply(lambda x: f"{x:.2%}")
+            st.dataframe(rank_df)
+
+        else:
+            st.error("⚠️ 警告：沒有任何一份問卷通過一致性檢定 (CR < 0.1)，無法進行群體整合。")
+            st.write("建議：請專家參考 Excel 中的「建議值」重新填答。")
+
     except Exception as e:
-        st.error(f"檔案讀取失敗：{e}")
+        st.error(f"檔案解析發生錯誤：{e}")
+        st.write("請確認上傳的是本系統產生的 Excel 格式。")
